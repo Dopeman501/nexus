@@ -1,0 +1,24 @@
+diff --git a/src/Program.cs b/src/Program.cs
+index d747082..6ded0b2 100644
+--- a/src/Program.cs
++++ b/src/Program.cs
+@@ -359 +359 @@ var builder = WebApplication.CreateSlimBuilder(new WebApplicationOptions
+-    WebRootPath = ResolveWebRoot(exeDir),
++    WebRootPath = testHost ? Path.Combine(exeDir, "wwwroot") : ResolveWebRoot(exeDir),
+@@ -395 +395,4 @@ builder.WebHost.ConfigureKestrel(k =>
+-    k.ListenAnyIP(servicePort);
++    if (testHost)
++        k.Listen(System.Net.IPAddress.Loopback, servicePort);
++    else
++        k.ListenAnyIP(servicePort);
+@@ -534,5 +537,3 @@ builder.Services.AddHostedService<Nexus.Service.Panel.DesktopWallpaperWatcher>()
+-// Emit mode starts the host far enough to register endpoints for the OpenAPI
+-// document (WebApplication defers that to StartAsync); drop every hosted service
+-// so no background device work runs during that start.
+-#if DEBUG
+-if (emitOpenApiPath is not null)
++// A test host can verify the real route table and packaged dashboard without
++// starting hardware control, vendor conflict handling, or background egress.
++if (testHost)
+@@ -540 +540,0 @@ if (emitOpenApiPath is not null)
+-#endif

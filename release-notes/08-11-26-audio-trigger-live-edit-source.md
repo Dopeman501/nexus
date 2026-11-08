@@ -18,3 +18,9 @@ Dependency manifests are unchanged. The current online npm audit reports the exi
 The LF/CRLF palette fixture failure and initial/New draft preview are explicitly follow-up work requested after this commit.
 
 Detailed local evidence: `builds/audio-trigger-live-edit-20261108/Verification.md` and its `commit-scope/` packet manifests/build logs. Workspace-root task, knowledge and action records remain outside this Git checkout.
+
+## Initial/New draft preview and palette-test follow-up
+
+Dashboard `d97570dfe1f663834b777512fbec51d5e1747f9c` commits initial/New draft preview before Add and normalizes LF/CRLF/CR in the raw stylesheet test. New drafts remain unsaved until Add; closing discards them. Remote-list invalidation and existing-entry automatic saves remain protected.
+
+All 1,022 web owner tests and eight production-browser cases passed during implementation, plus the unsaved shader/media case. The exact four-file commit packet separately passed 52 focused tests and its TypeScript/service build before commit. Existing dependency audit debt remains unchanged. Other working changes remain uncommitted; nothing was pushed or installed by this commit operation.

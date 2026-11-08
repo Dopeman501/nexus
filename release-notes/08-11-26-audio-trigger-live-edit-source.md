@@ -2,6 +2,8 @@
 
 8 November 2026. Local source commits only; no push or installation is part of this checkpoint.
 
+The subsequent user-authorized complete `.17` integration installed this source and the initial/New draft follow-up at **06:29:57 UTC** on 8 November, together with the corrected Lighting preview. Full inclusion, package and installed/served hashes passed; settings, presets and layout contents were retained. Physical acceptance remains pending. [Combined installation evidence](../builds/combined-preview-update-20261108/Verification.md).
+
 - Service: `3e1ac14dc02b2700e2f5ab6ce3e761837a573e94`.
 - Dashboard: `fb899d6e64e61a88df3c211006478c7cbba74524`.
 

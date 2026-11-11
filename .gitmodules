@@ -1,11 +1,11 @@
 [submodule "nexus-service"]
 	path = nexus-service
 	url = ../nexus-service.git
-	branch = local/d215-beta.2
+	branch = main
 [submodule "nexus-web"]
 	path = nexus-web
 	url = ../nexus-web.git
-	branch = local/d215-beta.2
+	branch = main
 [submodule "nexus-overlay"]
 	path = nexus-overlay
 	url = https://github.com/hello-nexus/nexus-overlay.git

@@ -11,6 +11,12 @@
 
 </div>
 
+This fork's `main` consolidates the complete locally installed Jungle Leopard D215
+feature set on the `3.1.8-beta.2-d215.19` baseline, including Audio Trigger controls,
+Lighting widget fixes and connection recovery. See the
+[installed-source release notes](release-notes/v3.1.8-beta.2-d215.19.md) for the
+source boundary, submodule ownership and verification limits.
+
 Nexus is a local-first hardware monitoring, control, RGB lighting and fan
 control suite for Windows, macOS, and Linux. A small native service runs on the
 machine, talks to the hardware, and serves a web dashboard you open in the
@@ -29,8 +35,8 @@ repository and documented by its own `README`.
 
 | Submodule | What it is |
 |---|---|
-| [`nexus-service`](https://github.com/hello-nexus/nexus-service) | The local service: hardware monitoring + control, RGB engine, dashboard host. .NET 10, native AOT. |
-| [`nexus-web`](https://github.com/hello-nexus/nexus-web) | The React + TypeScript dashboard, served by the service. |
+| [`nexus-service`](https://github.com/Dopeman501/nexus-service) | The local service: hardware monitoring + control, RGB engine, dashboard host. .NET 10, native AOT. |
+| [`nexus-web`](https://github.com/Dopeman501/nexus-web) | The React + TypeScript dashboard, served by the service. |
 | [`nexus-overlay`](https://github.com/hello-nexus/nexus-overlay) | The desktop / in-game overlay. |
 | [`nexus-rgb`](https://github.com/hello-nexus/nexus-rgb) | OpenRGB-headless workspace; provides the RGB device backends. |
 

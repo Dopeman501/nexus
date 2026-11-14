@@ -11,11 +11,12 @@
 
 </div>
 
-This fork's `main` consolidates the complete locally installed Jungle Leopard D215
-feature set on the `3.1.8-beta.2-d215.19` baseline, including Audio Trigger controls,
-Lighting widget fixes and connection recovery. See the
-[installed-source release notes](release-notes/v3.1.8-beta.2-d215.19.md) for the
-source boundary, submodule ownership and verification limits.
+This fork's `main` includes the locally installed Jungle Leopard D215
+`3.1.8-beta.2-d215.22` transition source: GL/Curtains backgrounds, a shared gallery,
+independent Audio Trigger beat timing and the isolated five-library sampler,
+above the existing Audio Trigger, Lighting and recovery features. See the
+[installed-source release notes](release-notes/v3.1.8-beta.2-d215.22.md) for the
+source boundary, verification and physical-acceptance limits.
 
 Nexus is a local-first hardware monitoring, control, RGB lighting and fan
 control suite for Windows, macOS, and Linux. A small native service runs on the
@@ -50,7 +51,7 @@ repository and documented by its own `README`.
 
 ```bash
 # Clone with all components
-git clone --recurse-submodules https://github.com/hello-nexus/nexus.git
+git clone --recurse-submodules https://github.com/Dopeman501/nexus.git
 cd nexus
 # (if cloned without submodules)
 git submodule update --init --recursive

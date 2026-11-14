@@ -11,11 +11,11 @@
 
 </div>
 
-This fork's `main` includes the locally installed Jungle Leopard D215
-`3.1.8-beta.2-d215.22` transition source: GL/Curtains backgrounds, a shared gallery,
-independent Audio Trigger beat timing and the isolated five-library sampler,
-above the existing Audio Trigger, Lighting and recovery features. See the
-[installed-source release notes](release-notes/v3.1.8-beta.2-d215.22.md) for the
+This fork's `main` includes the locally installed `3.1.8-beta.2-d215.23`
+source: Y70 Home and corner-drag page reordering with a stacked glass animation,
+above the retained Jungle Leopard D215, GL/Curtains transition, Audio Trigger,
+Lighting and recovery features. See the
+[installed-source release notes](release-notes/v3.1.8-beta.2-d215.23.md) for the
 source boundary, verification and physical-acceptance limits.
 
 Nexus is a local-first hardware monitoring, control, RGB lighting and fan

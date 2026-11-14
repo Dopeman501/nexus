@@ -10,7 +10,8 @@ if (Test-Path -LiteralPath $output) { throw 'Source output already exists.' }
 New-Item -ItemType Directory -Path (Split-Path -Parent $output) -Force | Out-Null
 
 function Read-Git([string]$Root, [string[]]$Arguments) {
-    $result = & git -C $Root @Arguments
+    # Archive must retain Git blob bytes, independent of Windows checkout filters.
+    $result = & git -c core.autocrlf=false -c core.eol=lf -C $Root @Arguments
     if ($LASTEXITCODE -ne 0) { throw 'Git source export failed.' }
     return ($result -join "`n")
 }

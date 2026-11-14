@@ -21,6 +21,8 @@ permissions:
 
 jobs:
   announce:
+    # This fork publishes independently; upstream webhooks are never invoked.
+    if: github.repository == 'hello-nexus/nexus'
     runs-on: ubuntu-latest
     steps:
       - name: wait for assets + composed notes, then post to Discord

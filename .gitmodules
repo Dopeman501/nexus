@@ -12,5 +12,5 @@
 	branch = main
 [submodule "nexus-rgb"]
 	path = nexus-rgb
-	url = https://github.com/hello-nexus/nexus-rgb.git
+	url = ../nexus-rgb.git
 	branch = main

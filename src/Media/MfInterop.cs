@@ -68,6 +68,9 @@ internal static unsafe class MfInterop
     [DllImport("mfplat.dll")]
     public static extern int MFCreateSample(out IntPtr sample);
 
+    [DllImport("mfplat.dll")]
+    public static extern int MFCreateTrackedSample(out IntPtr trackedSample);
+
     // mfapi.h:457.
     [DllImport("mfplat.dll")]
     public static extern int MFCreateMemoryBuffer(uint maxLength, out IntPtr buffer);
@@ -172,7 +175,7 @@ internal static unsafe class MfInterop
 
     // ===================== IMFMediaBuffer =====================
 
-    public static int Buffer_Lock(IntPtr buffer, out byte* data, out uint currentLength)
+    public static int Buffer_Lock(IntPtr buffer, out byte* data, out uint currentLength, out uint maximumLength)
     {
         byte* p;
         uint max, current;
@@ -180,6 +183,7 @@ internal static unsafe class MfInterop
         var hr = fn(buffer, &p, &max, &current);
         data = p;
         currentLength = current;
+        maximumLength = max;
         return hr;
     }
 

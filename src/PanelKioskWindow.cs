@@ -142,6 +142,7 @@ internal sealed unsafe class PanelKioskWindow : IWin32WindowOwner, IDisposable
     // re-resolves the monitor by. Same value MonitorKioskManager keys on.
     private readonly string _stableDisplayId;
     private IntPtr _env;
+    private IDisposable? _browserMemoryRegistration;
     private IntPtr _envOptions;
     private IntPtr _envCreatedHandler;
     private IntPtr _ctrlCreatedHandler;
@@ -765,6 +766,9 @@ internal sealed unsafe class PanelKioskWindow : IWin32WindowOwner, IDisposable
         if (WebView2Native.Failed(errorCode) || env == IntPtr.Zero) return;
         Wv2.AddRef(env);
         _env = env;
+        var memoryProfile = BrowserProcessRegistry.KioskProfile(_compatibilityRendering);
+        if (memoryProfile.HasValue)
+            _browserMemoryRegistration = WebView2MemorySampler.RegisterEnvironment(memoryProfile.Value, env);
         Native.PostMessageW(Hwnd, WM_INIT_CONTROLLER, IntPtr.Zero, IntPtr.Zero);
     }
 
@@ -1095,6 +1099,8 @@ internal sealed unsafe class PanelKioskWindow : IWin32WindowOwner, IDisposable
             }
             if (_coreWebView2 != IntPtr.Zero) { Wv2.Release(_coreWebView2); _coreWebView2 = IntPtr.Zero; }
             if (_controller2 != IntPtr.Zero) { Wv2.Release(_controller2); _controller2 = IntPtr.Zero; }
+            _browserMemoryRegistration?.Dispose();
+            _browserMemoryRegistration = null;
             if (_env != IntPtr.Zero) { Wv2.Release(_env); _env = IntPtr.Zero; }
             if (_envOptions != IntPtr.Zero) { Wv2.Release(_envOptions); _envOptions = IntPtr.Zero; }
             if (_envCreatedHandler != IntPtr.Zero) { Wv2.Release(_envCreatedHandler); _envCreatedHandler = IntPtr.Zero; }

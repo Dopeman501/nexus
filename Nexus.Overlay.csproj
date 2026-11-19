@@ -36,6 +36,14 @@
     <DebugSymbols>false</DebugSymbols>
   </PropertyGroup>
 
+  <!-- Bound ordinary short-lived managed garbage between natural collections.
+       The default budget grows with CPU cache; this low-allocation helper can
+       otherwise keep tens of MB of already-released frame wrappers. This is
+       a gen0 allocation budget, not a heap/private-memory limit or forced GC. -->
+  <ItemGroup Condition="$(RuntimeIdentifier.StartsWith('win'))">
+    <RuntimeHostConfigurationOption Include="System.GC.Gen0MaxBudget" Value="6291456" />
+  </ItemGroup>
+
   <ItemGroup>
     <!-- Exclude the test project tree - it has its own csproj and would
          otherwise be pulled into the SDK's default Compile glob and try

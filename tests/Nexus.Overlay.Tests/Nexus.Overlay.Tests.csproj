@@ -16,6 +16,7 @@
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.13.0" />
     <PackageReference Include="xunit" Version="2.9.3" />
     <PackageReference Include="xunit.runner.visualstudio" Version="3.0.2" />
+    <PackageReference Include="coverlet.collector" Version="6.0.4" />
   </ItemGroup>
 
   <ItemGroup>
@@ -46,10 +47,16 @@
     <Compile Include="..\..\src\Media\EncoderSelect.cs" Link="src\Media\EncoderSelect.cs" />
     <Compile Include="..\..\src\Media\FrameFraming.cs" Link="src\Media\FrameFraming.cs" />
     <Compile Include="..\..\src\Capture\StreamHostPlan.cs" Link="src\Capture\StreamHostPlan.cs" />
+    <Compile Include="..\..\src\Capture\CaptureFramePacer.cs" Link="src\Capture\CaptureFramePacer.cs" />
+    <Compile Include="..\..\src\Capture\StreamHostManager.cs" Link="src\Capture\StreamHostManager.cs" />
+    <Compile Include="..\..\src\Capture\StreamHostManager.Native.cs" Link="src\Capture\StreamHostManager.Native.cs" />
+    <Compile Include="..\..\src\Capture\StreamHostAdmission.cs" Link="src\Capture\StreamHostAdmission.cs" />
     <Compile Include="..\..\src\Capture\StreamWatchdogPolicy.cs" Link="src\Capture\StreamWatchdogPolicy.cs" />
     <Compile Include="..\..\src\Capture\WgcVtable.cs" Link="src\Capture\WgcVtable.cs" />
     <Compile Include="..\..\src\IdentifyBadge.cs" Link="src\IdentifyBadge.cs" />
     <Compile Include="..\..\src\ProcessTree.cs" Link="src\ProcessTree.cs" />
+    <Compile Include="..\..\src\BrowserProcessRegistry.cs" Link="src\BrowserProcessRegistry.cs" />
+    <Compile Include="..\..\src\BrowserProcessMemory.cs" Link="src\BrowserProcessMemory.cs" />
     <Compile Include="..\..\src\UserDataPaths.cs" Link="src\UserDataPaths.cs" />
     <Compile Include="..\..\src\Logger.cs" Link="src\Logger.cs" />
   </ItemGroup>

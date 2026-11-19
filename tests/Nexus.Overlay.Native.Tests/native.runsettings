@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<RunSettings>
+  <DataCollectionRunSettings>
+    <DataCollectors>
+      <DataCollector friendlyName="XPlat Code Coverage">
+        <Configuration>
+          <!-- The actual product sources are linked into this assembly. -->
+          <IncludeTestAssembly>true</IncludeTestAssembly>
+          <Include>[Nexus.Overlay.Native.Tests]Nexus.Overlay.*</Include>
+          <Exclude>[Nexus.Overlay.Native.Tests]Nexus.Overlay.Tests.*</Exclude>
+          <Format>cobertura,json</Format>
+        </Configuration>
+      </DataCollector>
+    </DataCollectors>
+  </DataCollectionRunSettings>
+</RunSettings>

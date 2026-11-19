@@ -66,6 +66,23 @@ internal sealed class NexusApi
         }
     }
 
+    internal async Task<bool> PostEfficiencyAckAsync(EfficiencyLeaseAck body)
+    {
+        try
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Post, "/diagnostics/efficiency/session/ack")
+            {
+                Content = new StringContent(JsonSerializer.Serialize(body, ApiJson.Default.EfficiencyLeaseAck),
+                    System.Text.Encoding.UTF8, "application/json"),
+            };
+            request.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", Token);
+            using var response = await _http.SendAsync(request).ConfigureAwait(false);
+            return response.IsSuccessStatusCode;
+        }
+        catch (HttpRequestException) { return false; }
+        catch (TaskCanceledException) { return false; }
+    }
+
     /// <summary>True when the service accepted the monitor map.</summary>
     public async Task<bool> PostMonitorsAsync(List<OverlayMonitorEntry> monitors)
     {
@@ -123,6 +140,8 @@ internal sealed class PairResponse
 /// <summary>GET /overlay/state. Field names mirror the service DTO.</summary>
 internal sealed class OverlayState
 {
+    [JsonPropertyName("efficiency")]
+    public EfficiencyLeaseProjection? Efficiency { get; set; }
     [JsonPropertyName("autoLaunch")]
     public bool AutoLaunch { get; set; }
     [JsonPropertyName("reserveMonitor")]
@@ -141,6 +160,22 @@ internal sealed class OverlayState
     public List<StreamAssignment> Streams { get; set; } = new();
     [JsonPropertyName("identify")]
     public IdentifyState? Identify { get; set; }
+}
+
+internal sealed class EfficiencyLeaseProjection
+{
+    public string ServiceGeneration { get; set; } = "";
+    public long Revision { get; set; }
+    public string? RunId { get; set; }
+    public int RemainingMs { get; set; }
+}
+
+internal sealed class EfficiencyLeaseAck
+{
+    public string ServiceGeneration { get; set; } = "";
+    public long Revision { get; set; }
+    public string RunId { get; set; } = "";
+    public string OverlayInstance { get; set; } = "";
 }
 
 /// <summary>A display identify still showing. A new token restarts it; RemainingMs is what is left.</summary>
@@ -245,6 +280,8 @@ internal sealed class ClientMemSample
 }
 
 [JsonSerializable(typeof(ClientMemSample))]
+[JsonSerializable(typeof(EfficiencyLeaseProjection))]
+[JsonSerializable(typeof(EfficiencyLeaseAck))]
 [JsonSerializable(typeof(PairResponse))]
 [JsonSerializable(typeof(OverlayState))]
 [JsonSerializable(typeof(IdentifyState))]

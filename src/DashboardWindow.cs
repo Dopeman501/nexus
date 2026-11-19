@@ -56,6 +56,10 @@ internal sealed unsafe class DashboardWindow : IWin32WindowOwner, IDisposable
     private const uint DefaultBgTransparent = 0x00000000u;
 
     private static readonly ConcurrentDictionary<int, DashboardWindow> _instances = new();
+    // The process-registered class and every dashboard share this one icon.
+    // Windows frees it at process exit; a window must never destroy it while
+    // the class or another window still references the handle.
+    private static readonly WindowClassIcon AppIcon = new(TryLoadAppIcon);
     private static int _nextInstanceId;
     private readonly int _instanceId;
 
@@ -67,6 +71,7 @@ internal sealed unsafe class DashboardWindow : IWin32WindowOwner, IDisposable
     /// <summary>The URL the window opened on: where the failure page's "Back to Nexus" returns to.</summary>
     private readonly string _homeUrl;
     private IntPtr _env;
+    private IDisposable? _browserMemoryRegistration;
     private IntPtr _envCreatedHandler;
     private IntPtr _ctrlCreatedHandler;
     private IntPtr _navStartingHandler;
@@ -108,7 +113,7 @@ internal sealed unsafe class DashboardWindow : IWin32WindowOwner, IDisposable
         // Load the Nexus app icon from the installed .ico for the taskbar /
         // Alt+Tab. No visible title bar, so the system can't infer one; load
         // explicitly.
-        var hIcon = TryLoadAppIcon();
+        var hIcon = AppIcon.Get();
 
         Hwnd = Win32Window.Create(
             WindowClassName,
@@ -254,7 +259,7 @@ internal sealed unsafe class DashboardWindow : IWin32WindowOwner, IDisposable
                 if (!File.Exists(path)) continue;
                 var hIcon = Native.LoadImageW(
                     IntPtr.Zero, path, Native.IMAGE_ICON, 0, 0,
-                    Native.LR_LOADFROMFILE | Native.LR_DEFAULTSIZE | Native.LR_SHARED);
+                    Native.LR_LOADFROMFILE | Native.LR_DEFAULTSIZE);
                 if (hIcon != IntPtr.Zero)
                 {
                     Log.Info($"dashboard loaded app icon from {path}");
@@ -651,6 +656,7 @@ internal sealed unsafe class DashboardWindow : IWin32WindowOwner, IDisposable
         if (WebView2Native.Failed(errorCode) || env == IntPtr.Zero) return;
         Wv2.AddRef(env);
         _env = env;
+        _browserMemoryRegistration = WebView2MemorySampler.RegisterEnvironment(BrowserProfile.Desktop, env);
         Native.PostMessageW(Hwnd, WM_INIT_CONTROLLER, IntPtr.Zero, IntPtr.Zero);
     }
 
@@ -1230,6 +1236,8 @@ internal sealed unsafe class DashboardWindow : IWin32WindowOwner, IDisposable
             if (_coreWebView2 != IntPtr.Zero) { Wv2.Release(_coreWebView2); _coreWebView2 = IntPtr.Zero; }
             if (_controller2 != IntPtr.Zero) { Wv2.Release(_controller2); _controller2 = IntPtr.Zero; }
             if (_coreWebView2_19 != IntPtr.Zero) { Wv2.Release(_coreWebView2_19); _coreWebView2_19 = IntPtr.Zero; }
+            _browserMemoryRegistration?.Dispose();
+            _browserMemoryRegistration = null;
             if (_env != IntPtr.Zero) { Wv2.Release(_env); _env = IntPtr.Zero; }
             // Release our local refs on the callback objects. The host
             // also AddRef'd them when we passed them into the add_* / env
@@ -1239,6 +1247,7 @@ internal sealed unsafe class DashboardWindow : IWin32WindowOwner, IDisposable
             if (_envCreatedHandler != IntPtr.Zero) { Wv2.Release(_envCreatedHandler); _envCreatedHandler = IntPtr.Zero; }
             if (_ctrlCreatedHandler != IntPtr.Zero) { Wv2.Release(_ctrlCreatedHandler); _ctrlCreatedHandler = IntPtr.Zero; }
             if (_navStartingHandler != IntPtr.Zero) { Wv2.Release(_navStartingHandler); _navStartingHandler = IntPtr.Zero; }
+            if (_navCompletedHandler != IntPtr.Zero) { Wv2.Release(_navCompletedHandler); _navCompletedHandler = IntPtr.Zero; }
             if (_newWindowHandler != IntPtr.Zero) { Wv2.Release(_newWindowHandler); _newWindowHandler = IntPtr.Zero; }
             if (_permissionHandler != IntPtr.Zero) { Wv2.Release(_permissionHandler); _permissionHandler = IntPtr.Zero; }
             if (_webMessageHandler != IntPtr.Zero) { Wv2.Release(_webMessageHandler); _webMessageHandler = IntPtr.Zero; }

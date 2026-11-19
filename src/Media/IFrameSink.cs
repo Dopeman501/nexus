@@ -1,4 +1,6 @@
 using System;
+using System.Threading.Tasks;
+using Nexus.Overlay.Capture;
 
 namespace Nexus.Overlay.Media;
 
@@ -10,6 +12,7 @@ namespace Nexus.Overlay.Media;
 /// </summary>
 internal interface IFrameSink : IDisposable
 {
-    /// <summary>Consumes one captured texture and releases the caller's reference to it.</summary>
-    void Submit(IntPtr texture2D);
+    /// <summary>Consumes the complete pool-frame lease, including on failure.</summary>
+    void Submit(CapturedFrame frame);
+    Task Completion { get; }
 }

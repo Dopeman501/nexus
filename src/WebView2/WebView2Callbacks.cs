@@ -11,10 +11,9 @@ namespace Nexus.Overlay.WebView2;
 /// IntPtr to WebView2. Static <c>[UnmanagedCallersOnly]</c> stubs at the
 /// vtable slots implement IUnknown + Invoke / each event signature.
 ///
-/// Lifetime: WebView2 holds its own AddRef on these. Once we hand the
-/// pointer over we never call Release ourselves - WebView2 cleans up when
-/// it removes the handler. We do AddRef once at creation so the initial
-/// refcount is 1.
+/// Lifetime: allocation returns one caller-owned reference. Registration
+/// may retain another native reference. Unregister before releasing the
+/// caller reference; both references must retire independently.
 /// </summary>
 internal static unsafe class WebView2Callbacks
 {

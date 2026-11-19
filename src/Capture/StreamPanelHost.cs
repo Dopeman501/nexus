@@ -5,6 +5,7 @@ using System.IO;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Threading;
+using System.Threading.Tasks;
 using Nexus.Overlay.Media;
 using Nexus.Overlay.WebView2;
 using Nexus.Overlay.Win32;
@@ -13,7 +14,7 @@ namespace Nexus.Overlay.Capture;
 
 /// <summary>
 /// One streamed-panel session: an off-screen WebView2 rendering
-/// <c>/panel/{id}</c>, captured via Windows.Graphics.Capture on a poll
+/// <c>/panel/{id}</c>, captured via Windows.Graphics.Capture on an event-driven
 /// thread, hardware-encoded to H.264 (<see cref="MfEncoder"/>), and pushed
 /// to the service ingest (<see cref="IngestClient"/>). The service owns
 /// pacing and the device transport; this host only produces frames.
@@ -22,7 +23,7 @@ namespace Nexus.Overlay.Capture;
 /// the occlusion-disable browser argument never touches the dashboard /
 /// kiosk / overlay surfaces sharing DesktopWebView2.
 /// </summary>
-internal sealed unsafe class StreamPanelHost : IWin32WindowOwner, IDisposable
+internal sealed unsafe class StreamPanelHost : IWin32WindowOwner, IStreamHost
 {
     private const string WindowClassName = "Nexus.Overlay.StreamHost";
     private const uint WM_INIT_CONTROLLER = Native.WM_USER + 7;
@@ -44,14 +45,22 @@ internal sealed unsafe class StreamPanelHost : IWin32WindowOwner, IDisposable
 
     public IntPtr Hwnd { get; private set; }
     public string SessionId { get; }
+    public string PanelDeviceId => _assignment.PanelDeviceId;
+    private readonly TaskCompletionSource _pumpExited = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly TaskCompletionSource _retired = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    public Task Completion => _retired.Task;
 
     /// <summary>Fires once (message-loop thread) when the host dies for any
     /// reason other than an explicit Dispose: ingest fault, engine init
     /// failure, external HWND destruction. The manager drops its entry; the
     /// next reconcile respawns while the session stays desired.</summary>
-    public Action? Faulted;
+    public Action? Faulted { get; set; }
 
     private readonly StreamAssignment _assignment;
+    private readonly DiagnosticLeaseOwner<CaptureDiagnostics> _diagnosticOwner = new();
+    private readonly Func<CaptureDiagnostics> _diagnosticFactory;
+    private readonly Func<CaptureDiagnostics?> _diagnosticProvider;
+    private CaptureDiagnostics? _diagnostics => _diagnosticOwner.Get(_diagnosticFactory);
     private readonly string _serviceOrigin;
     private readonly string _pairedToken;
     private readonly string _navigationUrl;
@@ -59,6 +68,7 @@ internal sealed unsafe class StreamPanelHost : IWin32WindowOwner, IDisposable
     private readonly int _pixelHeight;
 
     private IntPtr _env;
+    private IDisposable? _browserMemoryRegistration;
     private IntPtr _envOptions;
     private IntPtr _envCreatedHandler;
     private IntPtr _ctrlCreatedHandler;
@@ -90,7 +100,6 @@ internal sealed unsafe class StreamPanelHost : IWin32WindowOwner, IDisposable
     public StreamPanelHost(StreamAssignment assignment, string serviceOrigin, string pairedToken)
     {
         _instanceId = Interlocked.Increment(ref _nextInstanceId);
-        _instances[_instanceId] = this;
         _assignment = assignment;
         SessionId = assignment.SessionId;
         _serviceOrigin = serviceOrigin;
@@ -102,17 +111,24 @@ internal sealed unsafe class StreamPanelHost : IWin32WindowOwner, IDisposable
         // stride garbage.
         _pixelWidth = MakeEven((int)Math.Round(assignment.CssWidth * assignment.Dpr));
         _pixelHeight = MakeEven((int)Math.Round(assignment.CssHeight * assignment.Dpr));
+        _diagnosticFactory = () => new(Stopwatch.Frequency, Stopwatch.GetTimestamp(), SessionId);
+        _diagnosticProvider = () => _diagnostics;
+    }
 
+    /// <summary>Starts only after the manager has reserved this owner, including partial failures.</summary>
+    public void Start()
+    {
+        _instances[_instanceId] = this;
         try
         {
             Hwnd = Win32Window.Create(
                 WindowClassName,
-                $"Nexus Stream {assignment.PanelDeviceId}",
+                $"Nexus Stream {_assignment.PanelDeviceId}",
                 Native.WS_POPUP,
                 (uint)Native.WS_EX_TOOLWINDOW,
                 OffscreenOrigin, OffscreenOrigin, _pixelWidth, _pixelHeight,
                 this);
-            Log.Info($"stream-host {SessionId}: ctor {_pixelWidth}x{_pixelHeight}@{assignment.Fps} hwnd=0x{Hwnd:X}");
+            Log.Info($"stream-host {SessionId}: ctor {_pixelWidth}x{_pixelHeight}@{_assignment.Fps} hwnd=0x{Hwnd:X}");
             Native.ShowWindow(Hwnd, Native.SW_SHOWNOACTIVATE);
             StartWebView2Init();
         }
@@ -202,6 +218,7 @@ internal sealed unsafe class StreamPanelHost : IWin32WindowOwner, IDisposable
         }
         Wv2.AddRef(env);
         _env = env;
+        _browserMemoryRegistration = WebView2MemorySampler.RegisterEnvironment(BrowserProfile.Stream, env);
         Native.PostMessageW(Hwnd, WM_INIT_CONTROLLER, IntPtr.Zero, IntPtr.Zero);
     }
 
@@ -317,12 +334,12 @@ internal sealed unsafe class StreamPanelHost : IWin32WindowOwner, IDisposable
         _d3d = D3DDevice.Create();
         _capture = CreateCapture(_d3d);
         var writerNonce = Convert.ToHexString(System.Security.Cryptography.RandomNumberGenerator.GetBytes(8)).ToLowerInvariant();
-        var ingest = new IngestClient(_serviceOrigin, SessionId, _pairedToken, writerNonce);
+        var raw = string.Equals(_assignment.Codec, "rawBgra", StringComparison.OrdinalIgnoreCase);
+        var ingest = new IngestClient(_serviceOrigin, SessionId, _pairedToken, writerNonce, rawFrames: raw);
         ingest.Faulted = PostFault;
         _ingest = ingest;
         // Raw frames go to glass that takes a framebuffer (the Kraken LCD); everything
         // else is hardware-encoded. Same Submit contract either way.
-        var raw = string.Equals(_assignment.Codec, "rawBgra", StringComparison.OrdinalIgnoreCase);
         Log.Info($"stream-host {SessionId}: codec='{_assignment.Codec}' sink={(raw ? "raw" : "h264")}");
         if (raw)
         {
@@ -333,38 +350,61 @@ internal sealed unsafe class StreamPanelHost : IWin32WindowOwner, IDisposable
             }
             Log.Info($"stream-host {SessionId}: frame handoff={(_shared is null ? "http" : "shared section")}");
             sink = new RawFrameSink(_d3d, _pixelWidth, _pixelHeight,
-                (frame, key) => _ingest?.Send(frame, key, sink!.Return), SessionId, _shared);
+                (frame, key) => ingest.Send(frame, key, sink!.Return), SessionId, _shared, diagnosticsProvider: _diagnosticProvider);
             _encoder = sink;
         }
         else
         {
             _encoder = new MfEncoder(_d3d, _pixelWidth, _pixelHeight, fps, bitrateKbps,
-                (accessUnit, idr) => _ingest?.Send(accessUnit, idr), SessionId);
+                (accessUnit, idr) => ingest.Send(accessUnit, idr), SessionId, PostFault);
         }
 
+        StartPump();
+
+        Native.SetTimer(Hwnd, (nuint)TIMER_CAPTURE_WATCHDOG, WatchdogIntervalMs, IntPtr.Zero);
+        Log.Info($"stream-host {SessionId}: engine started");
+    }
+
+    // Separate the actual thread admission so startup failure is testable without
+    // constructing a real capture window, device or network connection.
+    private void StartPump(Action<Thread>? start = null)
+    {
         _pumpStop = false;
         _pumpThread = new Thread(PumpLoop)
         {
             IsBackground = true,
             Name = $"stream-pump-{SessionId}",
         };
-        _pumpThread.Start();
-
-        Native.SetTimer(Hwnd, (nuint)TIMER_CAPTURE_WATCHDOG, WatchdogIntervalMs, IntPtr.Zero);
-        Log.Info($"stream-host {SessionId}: engine started");
+        try
+        {
+            if (start is null) _pumpThread.Start();
+            else start(_pumpThread);
+        }
+        catch
+        {
+            // A failed admission cannot park retirement on a worker that never
+            // existed. Once started, only PumpLoop's finally can prove exit.
+            if ((_pumpThread.ThreadState & System.Threading.ThreadState.Unstarted) != 0)
+                _pumpThread = null;
+            throw;
+        }
     }
 
     private WgcCapture CreateCapture(D3DDevice d3d)
     {
+        // Publish ownership before native startup so partial failures remain reserved.
+        var capture = new WgcCapture(Hwnd, d3d, _pixelWidth, _pixelHeight, diagnosticsProvider: _diagnosticProvider);
+        _capture = capture;
         try
         {
-            return new WgcCapture(Hwnd, d3d, _pixelWidth, _pixelHeight);
+            capture.Start();
+            return capture;
         }
         catch (CaptureItemException ex) when (ex.HResult == E_INVALIDARG)
         {
             Log.Warn($"stream-host {SessionId}: CreateForWindow refused the tool window; capturing it as a plain window");
             CaptureWindowStyle.ClearToolWindow(Hwnd);
-            var capture = new WgcCapture(Hwnd, d3d, _pixelWidth, _pixelHeight);
+            capture.Start();
             // The shell adds the taskbar button asynchronously after the show;
             // the next watchdog tick deletes it.
             _taskbarTabPending = true;
@@ -374,24 +414,15 @@ internal sealed unsafe class StreamPanelHost : IWin32WindowOwner, IDisposable
 
     private void PumpLoop()
     {
-        // The poll sleeps in PumpFrames run at Windows' default 15.6 ms timer granularity
-        // otherwise, which with a two-buffer capture pool drops one 60 Hz frame in five.
-        TimeBeginPeriod(1);
         try
         {
             PumpFrames();
         }
         finally
         {
-            TimeEndPeriod(1);
+            _pumpExited.TrySetResult();
         }
     }
-
-    [DllImport("winmm.dll", EntryPoint = "timeBeginPeriod")]
-    private static extern uint TimeBeginPeriod(uint ms);
-
-    [DllImport("winmm.dll", EntryPoint = "timeEndPeriod")]
-    private static extern uint TimeEndPeriod(uint ms);
 
     private void PumpFrames()
     {
@@ -406,10 +437,10 @@ internal sealed unsafe class StreamPanelHost : IWin32WindowOwner, IDisposable
         // standing full and the render-on-arrival player turns the
         // congestion into visible time snaps.
         var targetFps = Math.Clamp(_assignment.Fps, 1, 240);
-        var submitStartTicks = 0L;
-        var submitted = 0L;
+        var pacer = new CaptureFramePacer(targetFps, Stopwatch.Frequency);
         while (!_pumpStop)
         {
+            ReportDiagnostics();
             // The pump is the only thread that touches the WGC objects, so
             // the watchdog's restart request executes here rather than
             // racing TryGetNextFrame with a released pool.
@@ -426,33 +457,36 @@ internal sealed unsafe class StreamPanelHost : IWin32WindowOwner, IDisposable
                     return;
                 }
             }
-            IntPtr texture;
+            CapturedFrame? frame;
+            int timestampHResult;
             bool got;
-            long frameTimeTicks;
+            var diagnostics = _diagnostics;
+            var pollStarted = diagnostics is not null ? Stopwatch.GetTimestamp() : 0;
             try
             {
-                got = capture.TryGetNextFrame(out texture, out frameTimeTicks);
+                got = capture.TryGetNextFrame(out frame, out timestampHResult);
+                diagnostics?.PollCompleted(pollStarted, Stopwatch.GetTimestamp(), got && frame is not null);
             }
             catch (Exception ex)
             {
+                diagnostics?.PollCompleted(pollStarted, Stopwatch.GetTimestamp(), returned: false, failed: true);
                 Log.Error($"stream-host {SessionId}: capture poll failed: {ex.Message}");
                 PostFault();
                 return;
             }
-            if (!got || texture == IntPtr.Zero)
+            if (!got || frame is null)
             {
                 // The pool is vsync-fed; a short sleep keeps poll cost nil
                 // without adding a visible frame of latency.
-                Thread.Sleep(2);
+                capture.WaitForFrame();
                 continue;
             }
-            // A capture gap is a hole in the content clock: the panel holds
-            // the last frame for the gap, then content time snaps forward.
-            // frameTs localizes it: a matching frameTs gap means the
-            // compositor produced nothing (renderer/page stall); a
-            // near-frame-interval frameTs delta means this thread polled late
-            // and the pool absorbed it.
+            long frameTimeTicks = frame.Timestamp;
+            // Arrival and returned-frame timestamp gaps identify a discontinuity,
+            // not its cause: compositor production, callback/pump delay and pool
+            // overwrite require the separate opt-in timeline measurements.
             var nowTicks = Stopwatch.GetTimestamp();
+            diagnostics?.FrameReturned(nowTicks, frameTimeTicks, timestampHResult);
             if (_lastFrameArrivalTicks != 0)
             {
                 var arrivalMs = (nowTicks - _lastFrameArrivalTicks) * 1000 / Stopwatch.Frequency;
@@ -472,36 +506,37 @@ internal sealed unsafe class StreamPanelHost : IWin32WindowOwner, IDisposable
             _lastFrameTimeTicks = frameTimeTicks;
             if (Interlocked.Increment(ref _framesPumped) == 1)
                 Log.Info($"stream-host {SessionId}: first frame captured");
-            if (submitStartTicks == 0) submitStartTicks = nowTicks;
-            var allowed = 1 + (nowTicks - submitStartTicks) * targetFps / Stopwatch.Frequency;
-            if (allowed - submitted > 3)
-            {
-                // A capture gap banked budget; spending it would burst the
-                // chain at compositor rate. Re-anchor instead.
-                submitStartTicks = nowTicks;
-                submitted = 0;
-            }
-            // One frame of slack: a page drawing at the stream rate lands on the display clock's
-            // grid, a little early or late, and must not lose a frame to that jitter.
-            else if (submitted > allowed)
+            if (!pacer.ShouldSubmit(nowTicks))
             {
                 // Over the fps budget: skip this frame. The texture is
                 // caller-owned and would otherwise leak.
-                Wv2.Release(texture);
+                frame.Dispose();
+                diagnostics?.BudgetDisposed();
                 continue;
             }
-            submitted++;
+            var submitStarted = diagnostics is not null ? Stopwatch.GetTimestamp() : 0;
             try
             {
-                encoder.Submit(texture);
+                encoder.Submit(frame);
+                diagnostics?.SubmitCompleted(submitStarted, Stopwatch.GetTimestamp(), success: true);
             }
             catch (Exception ex)
             {
+                diagnostics?.SubmitCompleted(submitStarted, Stopwatch.GetTimestamp(), success: false);
                 Log.Error($"stream-host {SessionId}: encode submit failed: {ex.Message}");
                 PostFault();
                 return;
             }
         }
+    }
+
+    private void ReportDiagnostics(bool final = false)
+    {
+        var epoch = EfficiencyDiagnosticOptions.SessionRevision;
+        if (_diagnostics?.Report(Stopwatch.GetTimestamp(), _pixelWidth, _pixelHeight,
+            Math.Clamp(_assignment.Fps, 1, 240),
+            string.Equals(_assignment.Codec, "rawBgra", StringComparison.OrdinalIgnoreCase), final) is { } line)
+            if (epoch != 0 && epoch == EfficiencyDiagnosticOptions.SessionRevision) Log.Info(line);
     }
 
     // WGC on an off-screen window can silently stop delivering frames; recreating item+pool+session on the
@@ -536,6 +571,7 @@ internal sealed unsafe class StreamPanelHost : IWin32WindowOwner, IDisposable
     {
         Log.Warn($"stream-host {SessionId}: {reason}, recreating WGC session");
         Interlocked.Exchange(ref _restartRequested, 1);
+        _capture?.Wake();
     }
 
     private void StartProbe()
@@ -602,10 +638,8 @@ internal sealed unsafe class StreamPanelHost : IWin32WindowOwner, IDisposable
         try { Native.KillTimer(Hwnd, (nuint)TIMER_CAPTURE_WATCHDOG); } catch { }
 
         _pumpStop = true;
-        var pumpExited = true;
-        if (_pumpThread is not null && Thread.CurrentThread != _pumpThread)
-            pumpExited = _pumpThread.Join(2000);
-        _pumpThread = null;
+        _capture?.Wake();
+        if (_pumpThread is null) _pumpExited.TrySetResult();
 
         if (_previewStream != IntPtr.Zero)
         {
@@ -613,27 +647,13 @@ internal sealed unsafe class StreamPanelHost : IWin32WindowOwner, IDisposable
             _previewStream = IntPtr.Zero;
         }
         _ingest?.Dispose();
-        _ingest = null;
-        if (!pumpExited)
+        _ = _pumpExited.Task.ContinueWith(_ => RetirePipeline(), TaskScheduler.Default);
+        _ = Completion.WaitAsync(TimeSpan.FromSeconds(5)).ContinueWith(observation =>
         {
-            // The pump may still be inside a wedged TryGetNextFrame/Submit on
-            // these objects; leaking them beats releasing under a live call.
-            Log.Warn($"stream-host {SessionId}: pump did not exit; leaking capture/encoder refs");
-            _encoder = null;
-            _capture = null;
-            _d3d = null;
-        }
-        else
-        {
-            _encoder?.Dispose();
-            _encoder = null;
-            _shared?.Dispose();
-            _shared = null;
-            _capture?.Dispose();
-            _capture = null;
-            _d3d?.Dispose();
-            _d3d = null;
-        }
+            if (observation.IsCompletedSuccessfully) return;
+            var failure = observation.Exception?.GetBaseException();
+            Log.Warn($"stream-host {SessionId}: retirement {(failure is TimeoutException ? "pending" : "failed")}; replacement remains blocked for {PanelDeviceId}");
+        }, TaskScheduler.Default);
 
         if (_coreWebView2 != IntPtr.Zero)
         {
@@ -650,6 +670,8 @@ internal sealed unsafe class StreamPanelHost : IWin32WindowOwner, IDisposable
         }
         if (_env != IntPtr.Zero)
         {
+            _browserMemoryRegistration?.Dispose();
+            _browserMemoryRegistration = null;
             Wv2.Release(_env);
             _env = IntPtr.Zero;
         }
@@ -670,6 +692,34 @@ internal sealed unsafe class StreamPanelHost : IWin32WindowOwner, IDisposable
             Native.DestroyWindow(hwnd);
         }
         Log.Info($"stream-host {SessionId}: disposed");
+    }
+
+    private void RetirePipeline()
+    {
+        try
+        {
+            _encoder?.Dispose();
+            _shared?.Dispose();
+            var completion = Task.WhenAll(_encoder?.Completion ?? Task.CompletedTask, _ingest?.Completion ?? Task.CompletedTask);
+            _ = completion.ContinueWith(result =>
+            {
+                if (!result.IsCompletedSuccessfully) { _retired.TrySetException(result.Exception!); return; }
+                try
+                {
+                    _capture?.Dispose();
+                    var callbacks = _capture?.Completion ?? Task.CompletedTask;
+                    _ = callbacks.ContinueWith(finished =>
+                    {
+                        if (!finished.IsCompletedSuccessfully) { _retired.TrySetException(finished.Exception!); return; }
+                        _d3d?.Dispose();
+                        ReportDiagnostics(final: true);
+                        _retired.TrySetResult();
+                    }, TaskScheduler.Default);
+                }
+                catch (Exception ex) { _retired.TrySetException(ex); }
+            }, TaskScheduler.Default);
+        }
+        catch (Exception ex) { _retired.TrySetException(ex); }
     }
 
     private static void ReleaseHandler(ref IntPtr handler)

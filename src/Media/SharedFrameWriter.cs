@@ -1,4 +1,5 @@
 using System;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Threading;
 
@@ -24,13 +25,18 @@ internal sealed unsafe class SharedFrameWriter : IDisposable
     private readonly IntPtr _ready;
     private readonly long _capacity;
     private bool _disposed;
+    private readonly string _sectionName;
+    private SharedFrameWriteDiagnostics? _diagnostics;
+    private long _diagnosticRevision;
+    private long _diagnosticFaultRevision;
 
-    private SharedFrameWriter(IntPtr mapping, byte* view, IntPtr ready, long capacity)
+    private SharedFrameWriter(IntPtr mapping, byte* view, IntPtr ready, long capacity, string sectionName)
     {
         _mapping = mapping;
         _view = view;
         _ready = ready;
         _capacity = capacity;
+        _sectionName = sectionName;
     }
 
     public const int ErrorMagic = -1;
@@ -78,7 +84,7 @@ internal sealed unsafe class SharedFrameWriter : IDisposable
             CloseHandle(mapping);
             return null;
         }
-        return new SharedFrameWriter(mapping, (byte*)view, ready, capacity);
+        return new SharedFrameWriter(mapping, (byte*)view, ready, capacity, sectionName);
     }
 
     /// <summary>Sequence of the last frame this writer published.</summary>
@@ -124,7 +130,33 @@ internal sealed unsafe class SharedFrameWriter : IDisposable
         Thread.MemoryBarrier();
         Volatile.Write(ref *(long*)(_view + 8), sequence + 2);
         SetEvent(_ready);
+        ObserveDiagnosticWrite(sequence + 2);
         return true;
+    }
+
+    private void ObserveDiagnosticWrite(long sequence)
+    {
+        var revision = EfficiencyDiagnosticOptions.SessionRevision;
+        if (revision == 0) { _diagnostics = null; _diagnosticRevision = 0; _diagnosticFaultRevision = 0; return; }
+        if (_diagnosticFaultRevision == revision) return;
+        try
+        {
+            var now = Stopwatch.GetTimestamp();
+            if (_diagnosticRevision != revision)
+            {
+                _diagnostics = new SharedFrameWriteDiagnostics(_sectionName, revision, Stopwatch.Frequency, now);
+                _diagnosticRevision = revision;
+            }
+            _diagnostics!.Observe(sequence, ConsumedSequence);
+            var line = _diagnostics.Report(now);
+            if (line is not null && EfficiencyDiagnosticOptions.SessionRevision == revision) Log.Info(line);
+        }
+        catch (Exception)
+        {
+            // Diagnostics do not change shared publication or frame ownership.
+            _diagnostics = null; _diagnosticRevision = 0;
+            _diagnosticFaultRevision = revision;
+        }
     }
 
     public void Dispose()

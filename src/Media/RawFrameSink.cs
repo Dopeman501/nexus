@@ -1,6 +1,7 @@
 using System;
-using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
+using System.Threading.Tasks;
 using Nexus.Overlay.Capture;
 using Nexus.Overlay.WebView2;
 
@@ -28,19 +29,26 @@ internal sealed unsafe class RawFrameSink : IFrameSink
     private readonly Action<byte[], bool> _onFrame;
     private readonly IntPtr _context;
 
-    // Frames are megabytes each; enough spares to cover the few a send can have in flight.
-    private const int MaxSpareFrames = 4;
-    private readonly ConcurrentQueue<byte[]> _spare = new();
+    // All producer/pending/in-flight arrays share these three leases.
+    private readonly RawFrameBufferPool _buffers;
+    private readonly TaskCompletionSource _readbackSettled = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private CapturedFrame? _quarantinedFrame;
+    public Task Completion => Task.WhenAll(_buffers.Completion, _readbackSettled.Task);
 
     private readonly SharedFrameLink? _shared;
+    private readonly Func<CaptureDiagnostics?> _diagnosticProvider;
+    private CaptureDiagnostics? _diagnostics => _diagnosticProvider();
     private IntPtr _staging;
     private bool _disposed;
 
     /// <param name="shared">When set, a mapped frame is written straight into the shared section and
     /// <paramref name="onFrame"/> only sees frames the section could not take.</param>
-    public RawFrameSink(D3DDevice device, int width, int height, Action<byte[], bool> onFrame, string logTag, SharedFrameLink? shared = null)
+    public RawFrameSink(D3DDevice device, int width, int height, Action<byte[], bool> onFrame, string logTag,
+        SharedFrameLink? shared = null, CaptureDiagnostics? diagnostics = null, Func<CaptureDiagnostics?>? diagnosticsProvider = null)
     {
         _shared = shared;
+        _diagnosticProvider = diagnosticsProvider ?? (() => diagnostics);
+        _buffers = new RawFrameBufferPool(width, height);
         _width = width;
         _height = height;
         _onFrame = onFrame;
@@ -56,7 +64,8 @@ internal sealed unsafe class RawFrameSink : IFrameSink
         }
         _context = ctx;
 
-        _staging = CreateStaging(device.Device, width, height);
+        try { _staging = CreateStaging(device.Device, width, height); }
+        catch { Wv2.Release(ctx); _buffers.Dispose(); throw; }
     }
 
     private static IntPtr CreateStaging(IntPtr device, int width, int height)
@@ -89,34 +98,35 @@ internal sealed unsafe class RawFrameSink : IFrameSink
     /// <summary>Hands back a frame whose bytes have been sent, for a later Submit to fill.</summary>
     public void Return(byte[] frame)
     {
-        if (frame.Length == _width * 4 * _height && _spare.Count < MaxSpareFrames)
-        {
-            _spare.Enqueue(frame);
-        }
+        _buffers.Return(frame);
     }
 
     /// <summary>
     /// Copies one captured texture out and emits it. Releases the caller's texture
     /// reference, as the encoder's Submit does.
     /// </summary>
-    public void Submit(IntPtr texture)
+    public void Submit(CapturedFrame frame)
     {
-        if (texture == IntPtr.Zero)
-        {
-            return;
-        }
         try
         {
-            SubmitCore(texture);
+            SubmitCore(frame.Texture);
+        }
+        catch (ReadbackUnavailableException)
+        {
+            // Failed Map is not proof that the queued GPU copy stopped reading WGC.
+            // Keep the entire native graph in the reserved host until process recovery.
+            _quarantinedFrame = frame;
+            throw;
         }
         finally
         {
-            Wv2.Release(texture);
+            if (!ReferenceEquals(_quarantinedFrame, frame)) frame.Dispose();
         }
     }
 
     private void SubmitCore(IntPtr texture)
     {
+        var diagnostics = _diagnostics;
         if (_disposed || _staging == IntPtr.Zero)
         {
             return;
@@ -129,26 +139,29 @@ internal sealed unsafe class RawFrameSink : IFrameSink
         var map = (delegate* unmanaged[Stdcall]<IntPtr, IntPtr, uint, uint, uint, D3D11Vtable.D3D11_MAPPED_SUBRESOURCE*, int>)
             Wv2.Slot(_context, D3D11Vtable.Context_Map);
         D3D11Vtable.D3D11_MAPPED_SUBRESOURCE mapped;
+        var mapStarted = diagnostics is not null ? Stopwatch.GetTimestamp() : 0;
         var hr = map(_context, _staging, 0, D3D11Vtable.D3D11_MAP_READ, 0, &mapped);
+        diagnostics?.MapCompleted(mapStarted, Stopwatch.GetTimestamp(), hr >= 0 && mapped.pData != IntPtr.Zero);
         if (hr < 0 || mapped.pData == IntPtr.Zero)
         {
-            Log.Error($"{_logTag}: staging Map failed: 0x{hr:X8}");
-            return;
-        }
-        if (_shared is not null && _shared.TryWrite((byte*)mapped.pData, mapped.RowPitch, _width, _height))
-        {
-            var unmapShared = (delegate* unmanaged[Stdcall]<IntPtr, IntPtr, uint, void>)
-                Wv2.Slot(_context, D3D11Vtable.Context_Unmap);
-            unmapShared(_context, _staging, 0);
-            return;
+            throw new ReadbackUnavailableException($"{_logTag}: staging Map failed: 0x{hr:X8}; source is quarantined");
         }
         int rowBytes = _width * 4;
-        if (!_spare.TryDequeue(out var frame))
-        {
-            frame = new byte[rowBytes * _height];
-        }
+        byte[]? frame = null;
+        var copyStarted = diagnostics is not null ? Stopwatch.GetTimestamp() : 0;
         try
         {
+            if (_shared is not null && _shared.TryWrite((byte*)mapped.pData, mapped.RowPitch, _width, _height))
+            {
+                diagnostics?.CopyCompleted(copyStarted, Stopwatch.GetTimestamp(), shared: true);
+                return;
+            }
+            frame = _buffers.TryRent();
+            if (frame is null)
+            {
+                diagnostics?.CopyCompleted(copyStarted, Stopwatch.GetTimestamp(), shared: false, bufferExhausted: true);
+                return; // all three leases are still owned downstream
+            }
             // RowPitch is the driver's stride and is >= width*4; copy row by row so the
             // callback always receives tightly packed rows.
             var src = (byte*)mapped.pData;
@@ -166,6 +179,12 @@ internal sealed unsafe class RawFrameSink : IFrameSink
                     }
                 }
             }
+            diagnostics?.CopyCompleted(copyStarted, Stopwatch.GetTimestamp(), shared: false);
+        }
+        catch
+        {
+            if (frame is not null) Return(frame);
+            throw;
         }
         finally
         {
@@ -175,13 +194,23 @@ internal sealed unsafe class RawFrameSink : IFrameSink
         }
 
         // Every raw frame stands alone, so each one is a keyframe.
-        _onFrame(frame, true);
+        if (frame is not null)
+        {
+            try { _onFrame(frame, true); }
+            catch { Return(frame); throw; }
+        }
     }
 
     public void Dispose()
     {
         if (_disposed) return;
         _disposed = true;
+        _buffers.Dispose();
+        if (_quarantinedFrame is not null)
+        {
+            Log.Warn($"{_logTag}: GPU readback remains quarantined; host process recovery is required");
+            return;
+        }
         if (_staging != IntPtr.Zero)
         {
             Marshal.Release(_staging);
@@ -191,5 +220,8 @@ internal sealed unsafe class RawFrameSink : IFrameSink
         {
             Marshal.Release(_context);
         }
+        _readbackSettled.TrySetResult();
     }
+
+    private sealed class ReadbackUnavailableException(string message) : InvalidOperationException(message);
 }

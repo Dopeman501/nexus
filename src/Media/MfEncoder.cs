@@ -2,17 +2,19 @@ using System;
 using System.Collections.Concurrent;
 using System.Runtime.InteropServices;
 using System.Threading;
+using System.Threading.Tasks;
 using Nexus.Overlay.Capture;
 using Nexus.Overlay.WebView2;
 
 namespace Nexus.Overlay.Media;
 
 /// <summary>
-/// Zero-copy Media Foundation H.264 encoder for WGC D3D11 BGRA textures:
+/// GPU-only Media Foundation H.264 encoder for owned D3D11 BGRA textures:
 /// BGRA texture -> Video Processor MFT (GPU BGRA->NV12) -> async hardware
 /// H.264 encoder MFT -> Annex-B access units via the callback. The D3D11
-/// device is shared with both MFTs through an MF DXGI device manager, so
-/// frames never touch system memory until they are compressed. Port of the
+/// device is shared with both MFTs through an MF DXGI device manager. WGC
+/// leases end after a completed GPU copy; tracked samples retain owned slots.
+/// Frames never touch system memory until compressed. Port of the
 /// bench-proven prototype (prototypes/artinchip-d213/d213wv2/MfEncoder.cs)
 /// onto raw vtable interop.
 ///
@@ -38,12 +40,17 @@ internal sealed unsafe class MfEncoder : IFrameSink
     private readonly int _fps;
     private readonly string _logTag;
     private readonly Action<byte[], bool> _onAccessUnit;
+    private readonly Action? _onFault;
     private readonly IntPtr _devMgr;
     private readonly IntPtr _vproc;
     private readonly IntPtr _enc;
     private readonly IntPtr _encEvents;
     private readonly Thread _eventThread;
     private readonly BlockingCollection<IntPtr> _nv12 = new(Nv12QueueCapacity);
+    private readonly OwnedTextureRing _textures;
+    private readonly TaskCompletionSource _exited = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly TaskCompletionSource _retired = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    public Task Completion => _retired.Task;
 
     private long _pts;
     private long _needIn;
@@ -55,17 +62,21 @@ internal sealed unsafe class MfEncoder : IFrameSink
     private volatile bool _running = true;
     private bool _disposed;
 
-    public MfEncoder(D3DDevice device, int width, int height, int fps, int bitrateKbps, Action<byte[], bool> onAccessUnit, string logTag = "")
+    public MfEncoder(D3DDevice device, int width, int height, int fps, int bitrateKbps, Action<byte[], bool> onAccessUnit, string logTag = "", Action? onFault = null)
     {
         _width = width;
         _height = height;
         _fps = fps;
         _logTag = logTag;
         _onAccessUnit = onAccessUnit;
+        _onFault = onFault;
+        _textures = new OwnedTextureRing(device, width, height);
 
-        Check(MfInterop.MFStartup(MfVtable.MF_VERSION, MfVtable.MFSTARTUP_NOSOCKET), "MFStartup");
+        bool started = false;
         try
         {
+            Check(MfInterop.MFStartup(MfVtable.MF_VERSION, MfVtable.MFSTARTUP_NOSOCKET), "MFStartup");
+            started = true;
             Check(MfInterop.MFCreateDXGIDeviceManager(out var resetToken, out _devMgr), "MFCreateDXGIDeviceManager");
             Check(MfInterop.DevMgr_ResetDevice(_devMgr, device.Device, resetToken), "ResetDevice");
 
@@ -99,40 +110,35 @@ internal sealed unsafe class MfEncoder : IFrameSink
             if (_enc != IntPtr.Zero) Wv2.Release(_enc);
             if (_vproc != IntPtr.Zero) Wv2.Release(_vproc);
             if (_devMgr != IntPtr.Zero) Wv2.Release(_devMgr);
-            MfInterop.MFShutdown();
+            if (started) MfInterop.MFShutdown();
+            _textures.Dispose();
             throw;
         }
 
         _eventThread = new Thread(EventLoop) { IsBackground = true, Name = "mf-encoder-events" };
-        _eventThread.Start();
+        try { _eventThread.Start(); }
+        catch { ReleasePipeline(); throw; }
         Log.Info($"stream-encoder: pipeline ready {_width}x{_height}@{_fps} {bitrateKbps}kbps");
     }
 
     /// <summary>
     /// Feeds one BGRA ID3D11Texture2D through the vproc and queues the NV12
-    /// output for the encoder's need-input events. Takes ownership of
-    /// <paramref name="texture2D"/>: it is released once the vproc
-    /// ProcessInput path completes or the frame is dropped.
+    /// output for the encoder's need-input events. Takes ownership of the
+    /// complete pool-frame lease, including dropped or failed submissions.
     /// </summary>
-    public void Submit(IntPtr texture2D)
+    public void Submit(CapturedFrame frame)
     {
         if (!_running)
         {
-            Wv2.Release(texture2D);
+            frame.Dispose();
             return;
         }
 
-        var buffer = IntPtr.Zero;
         var sample = IntPtr.Zero;
         try
         {
-            var hr = MfInterop.MFCreateDXGISurfaceBuffer(
-                D3D11Interop.IID_ID3D11Texture2D, texture2D, 0, 0, out buffer);
-            if (hr < 0) { LogSubmitError("MFCreateDXGISurfaceBuffer", hr); return; }
-            hr = MfInterop.MFCreateSample(out sample);
-            if (hr < 0) { LogSubmitError("MFCreateSample", hr); return; }
-            hr = MfInterop.Sample_AddBuffer(sample, buffer);
-            if (hr < 0) { LogSubmitError("AddBuffer", hr); return; }
+            sample = _textures.CopyToSample(frame);
+            if (sample == IntPtr.Zero) return;
 
             // 10MHz (100ns) units; monotonic pts at the nominal frame cadence.
             var duration = 10_000_000L / _fps;
@@ -140,7 +146,7 @@ internal sealed unsafe class MfEncoder : IFrameSink
             MfInterop.Sample_SetSampleDuration(sample, duration);
             _pts += duration;
 
-            hr = MfInterop.Xform_ProcessInput(_vproc, 0, sample, 0);
+            var hr = MfInterop.Xform_ProcessInput(_vproc, 0, sample, 0);
             if (hr < 0) { LogSubmitError("vproc ProcessInput", hr); return; }
         }
         finally
@@ -148,8 +154,6 @@ internal sealed unsafe class MfEncoder : IFrameSink
             // The vproc AddRef'd what it needs; dropping our refs lets its
             // sample pool recycle.
             if (sample != IntPtr.Zero) Wv2.Release(sample);
-            if (buffer != IntPtr.Zero) Wv2.Release(buffer);
-            Wv2.Release(texture2D);
         }
 
         DrainVproc();
@@ -166,21 +170,24 @@ internal sealed unsafe class MfEncoder : IFrameSink
         // session is live, and the Join below would then stall the message
         // loop for its full timeout on every single-session close.
         MfInterop.EventGen_QueueEvent(_encEvents, MfVtable.MEError);
-        if (!_eventThread.Join(5000))
-        {
-            // The encoder objects the thread may still touch are leaked
-            // deliberately rather than released under a live call.
-            Log.Warn("stream-encoder: event thread did not exit; leaking encoder refs");
-            DrainQueue();
-            MfInterop.MFShutdown();
-            return;
-        }
+        // Retain this owner until the native call actually exits; never block the UI or
+        // release an MFT beneath GetEvent/ProcessInput after a timeout.
+        _ = _exited.Task.ContinueWith(_ => ReleasePipeline(), TaskScheduler.Default);
+    }
+
+    private void ReleasePipeline()
+    {
         DrainQueue();
         if (_encEvents != IntPtr.Zero) Wv2.Release(_encEvents);
         if (_enc != IntPtr.Zero) Wv2.Release(_enc);
         if (_vproc != IntPtr.Zero) Wv2.Release(_vproc);
         if (_devMgr != IntPtr.Zero) Wv2.Release(_devMgr);
-        MfInterop.MFShutdown();
+        _textures.Dispose();
+        _ = _textures.Completion.ContinueWith(_ =>
+        {
+            MfInterop.MFShutdown();
+            _retired.TrySetResult();
+        }, TaskScheduler.Default);
         Log.Info("stream-encoder: disposed");
     }
 
@@ -356,6 +363,8 @@ internal sealed unsafe class MfEncoder : IFrameSink
 
     private void EventLoop()
     {
+        try
+        {
         while (_running)
         {
             var hr = MfInterop.EventGen_GetEvent(_encEvents, 0, out var mediaEvent);
@@ -374,12 +383,15 @@ internal sealed unsafe class MfEncoder : IFrameSink
             {
                 // A background-thread exception would kill the process.
                 Log.Error($"stream-encoder: event handler failed: {ex.GetType().Name}: {ex.Message}");
+                _onFault?.Invoke();
             }
             finally
             {
                 Wv2.Release(mediaEvent);
             }
         }
+        }
+        finally { _exited.TrySetResult(); }
     }
 
     private void OnNeedInput()
@@ -434,26 +446,18 @@ internal sealed unsafe class MfEncoder : IFrameSink
         var sample = db.pSample;
         byte[]? accessUnit = null;
         var isIdr = false;
-        if (MfInterop.Sample_ConvertToContiguousBuffer(sample, out var buffer) >= 0 && buffer != IntPtr.Zero)
+        try
         {
-            if (MfInterop.Buffer_Lock(buffer, out var data, out var length) >= 0)
+            accessUnit = ReadAccessUnit(sample);
+            if (accessUnit is { Length: > 0 })
             {
-                accessUnit = new byte[length];
-                new ReadOnlySpan<byte>(data, (int)length).CopyTo(accessUnit);
-                MfInterop.Buffer_Unlock(buffer);
+                // CleanPoint marks a safe decode entry; absent attribute falls back to NAL inspection.
+                isIdr = MfInterop.Attr_GetUINT32(sample, MfVtable.MFSampleExtension_CleanPoint, out var clean) >= 0
+                    ? clean == 1 : AnnexB.ContainsIdr(accessUnit);
             }
-            Wv2.Release(buffer);
-        }
-        if (accessUnit is { Length: > 0 })
-        {
-            // CleanPoint marks the sample as a safe decode entry (IDR);
-            // absent attribute falls back to scanning the NAL units.
-            isIdr = MfInterop.Attr_GetUINT32(sample, MfVtable.MFSampleExtension_CleanPoint, out var clean) >= 0
-                ? clean == 1
-                : AnnexB.ContainsIdr(accessUnit);
         }
         // Recycle the encoder's pool slot before invoking the callback.
-        Wv2.Release(sample);
+        finally { Wv2.Release(sample); }
 
         if (accessUnit is { Length: > 0 })
         {
@@ -476,6 +480,25 @@ internal sealed unsafe class MfEncoder : IFrameSink
     }
 
     // ===================== helpers =====================
+
+    internal static byte[]? ReadAccessUnit(IntPtr sample)
+    {
+        if (MfInterop.Sample_ConvertToContiguousBuffer(sample, out var buffer) < 0 || buffer == IntPtr.Zero) return null;
+        try
+        {
+            if (MfInterop.Buffer_Lock(buffer, out var data, out var length, out var maximum) < 0) return null;
+            try
+            {
+                if (length > RawFrameBufferPool.MaximumPayloadBytes || length > maximum || (data == null && length != 0))
+                    throw new InvalidOperationException("Encoder access unit has invalid storage or exceeds the wire payload ceiling");
+                var accessUnit = new byte[length];
+                new ReadOnlySpan<byte>(data, (int)length).CopyTo(accessUnit);
+                return accessUnit;
+            }
+            finally { MfInterop.Buffer_Unlock(buffer); }
+        }
+        finally { Wv2.Release(buffer); }
+    }
 
     private void DrainQueue()
     {

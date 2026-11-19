@@ -1,5 +1,7 @@
 using System;
 using System.Runtime.InteropServices;
+using System.Collections.Generic;
+using System.Threading.Tasks;
 using Nexus.Overlay.WebView2;
 
 namespace Nexus.Overlay.Capture;
@@ -16,8 +18,7 @@ internal struct SizeInt32
 }
 
 /// <summary>
-/// Windows.Graphics.Capture session over one HWND, caller-driven: no
-/// FrameArrived subscription, the owner polls <see cref="TryGetNextFrame"/>.
+/// Windows.Graphics.Capture over one HWND; frame arrival only wakes its owner.
 /// WGC on an off-screen window silently stops delivering frames after
 /// minutes; <see cref="Restart"/> rebuilds item+pool+session on the same
 /// HWND, which re-hooks in under a second (bench-proven; the shared
@@ -42,48 +43,77 @@ internal sealed unsafe class WgcCapture : IDisposable
     private IntPtr _pool;
     private IntPtr _session;
     private bool _disposed;
+    private readonly CaptureWakeSignal _wake;
+    private readonly Func<CaptureDiagnostics?> _diagnosticProvider;
+    private CaptureDiagnostics? _diagnostics => _diagnosticProvider();
+    private NativeSignalCallback? _arrival;
+    private long _arrivalToken;
+    private bool _arrivalSubscribed;
+    private readonly List<Task> _retiredCallbacks = new();
+    internal Task Completion => Task.WhenAll(_retiredCallbacks);
+    internal void Wake() => _wake.Signal();
+    internal bool WaitForFrame() => _wake.Wait();
 
-    public WgcCapture(IntPtr hwnd, D3DDevice device, int pixelWidth, int pixelHeight)
+    public WgcCapture(IntPtr hwnd, D3DDevice device, int pixelWidth, int pixelHeight, CaptureDiagnostics? diagnostics = null,
+        Func<CaptureDiagnostics?>? diagnosticsProvider = null)
     {
         _hwnd = hwnd;
         _device = device;
         _width = pixelWidth;
         _height = pixelHeight;
-        CreateSession();
+        _diagnosticProvider = diagnosticsProvider ?? (() => diagnostics);
+        _wake = new(diagnostics, _diagnosticProvider);
+    }
+
+    internal void Start()
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        try { CreateSession(); }
+        catch { ReleaseSession(); throw; }
     }
 
     /// <summary>
-    /// Dequeues the next captured frame's ID3D11Texture2D. Returns false when
-    /// the pool is empty. On true the caller owns the returned texture
-    /// reference and must release it (MfEncoder.Submit takes that ownership).
-    /// frameTimeTicks is the frame's SystemRelativeTime (QPC-based 100ns
-    /// ticks): a gap here means the compositor produced nothing, while an
-    /// arrival gap with contiguous frame times means the poll ran late.
+    /// Returns a pool-frame lease, or false when empty. The consumer closes it
+    /// after synchronous CPU reading or a completed copy into owned GPU storage.
+    /// Its timestamp is SystemRelativeTime in QPC-based 100ns ticks.
     /// </summary>
-    public bool TryGetNextFrame(out IntPtr texture, out long frameTimeTicks)
+    public bool TryGetNextFrame(out CapturedFrame? captured) => TryGetNextFrame(out captured, out _);
+
+    internal bool TryGetNextFrame(out CapturedFrame? captured, out int timestampHResult)
     {
-        texture = IntPtr.Zero;
-        frameTimeTicks = 0;
+        captured = null;
+        timestampHResult = 0;
+        long frameTimeTicks = 0;
         if (_pool == IntPtr.Zero) return false;
 
-        IntPtr frame;
+        IntPtr frame = IntPtr.Zero;
         var tryGet = (delegate* unmanaged[Stdcall]<IntPtr, IntPtr*, int>)Wv2.Slot(_pool, WgcVtable.Pool_TryGetNextFrame);
-        if (tryGet(_pool, &frame) < 0 || frame == IntPtr.Zero) return false;
+        var getHr = tryGet(_pool, &frame);
+        if (getHr < 0 || frame == IntPtr.Zero)
+        {
+            _diagnostics?.PoolRead(empty: frame == IntPtr.Zero, failed: getHr < 0);
+            return false;
+        }
 
         try
         {
             long frameTime;
             var getTime = (delegate* unmanaged[Stdcall]<IntPtr, long*, int>)Wv2.Slot(frame, WgcVtable.Frame_get_SystemRelativeTime);
-            if (getTime(frame, &frameTime) >= 0) frameTimeTicks = frameTime;
+            timestampHResult = getTime(frame, &frameTime);
+            if (timestampHResult >= 0) frameTimeTicks = frameTime;
 
             IntPtr surface;
             var getSurface = (delegate* unmanaged[Stdcall]<IntPtr, IntPtr*, int>)Wv2.Slot(frame, WgcVtable.Frame_get_Surface);
-            if (getSurface(frame, &surface) < 0 || surface == IntPtr.Zero) return false;
+            if (getSurface(frame, &surface) < 0 || surface == IntPtr.Zero)
+            {
+                _diagnostics?.ExtractionFailed();
+                return false;
+            }
 
             try
             {
                 var access = Wv2.QueryInterface(surface, WgcVtable.IID_IDirect3DDxgiInterfaceAccess);
-                if (access == IntPtr.Zero) return false;
+                if (access == IntPtr.Zero) { _diagnostics?.ExtractionFailed(); return false; }
                 try
                 {
                     IntPtr tex;
@@ -91,21 +121,27 @@ internal sealed unsafe class WgcCapture : IDisposable
                         Wv2.Slot(access, WgcVtable.InterfaceAccess_GetInterface);
                     fixed (Guid* iid = &D3D11Interop.IID_ID3D11Texture2D)
                     {
-                        if (getInterface(access, iid, &tex) < 0 || tex == IntPtr.Zero) return false;
+                        if (getInterface(access, iid, &tex) < 0 || tex == IntPtr.Zero)
+                        {
+                            _diagnostics?.ExtractionFailed();
+                            return false;
+                        }
                     }
-                    texture = tex;
+                    captured = CapturedFrame.Create(frame, tex, frameTimeTicks);
+                    frame = IntPtr.Zero; // ownership transfers to the consumer
                     return true;
                 }
                 finally { Wv2.Release(access); }
             }
             finally { Wv2.Release(surface); }
         }
-        finally { CloseAndRelease(frame); }
+        finally { if (frame != IntPtr.Zero) CapturedFrame.Close(frame); }
     }
 
     /// <summary>Tears down and recreates item+pool+session on the same HWND.</summary>
     public void Restart()
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
         ReleaseSession();
         CreateSession();
     }
@@ -115,10 +151,14 @@ internal sealed unsafe class WgcCapture : IDisposable
         if (_disposed) return;
         _disposed = true;
         ReleaseSession();
+        _wake.Dispose();
     }
 
     private void CreateSession()
     {
+        _retiredCallbacks.RemoveAll(task => task.IsCompletedSuccessfully);
+        if (_retiredCallbacks.Count != 0)
+            throw new InvalidOperationException("Capture callback retirement is still pending.");
         // GraphicsCaptureItem via the interop factory (no WinRT projection
         // for CreateForWindow exists).
         var interop = WinRtInterop.GetActivationFactory(
@@ -160,6 +200,19 @@ internal sealed unsafe class WgcCapture : IDisposable
             _pool = pool;
         }
         finally { Wv2.Release(statics); }
+
+        _arrival = new NativeSignalCallback(_wake.SignalFrame);
+        var subscribe = (delegate* unmanaged[Stdcall]<IntPtr, IntPtr, long*, int>)
+            Wv2.Slot(_pool, WgcVtable.Pool_add_FrameArrived);
+        long arrivalToken;
+        var arrivalHr = subscribe(_pool, _arrival.Pointer, &arrivalToken);
+        if (arrivalHr < 0)
+        {
+            ReleaseSession();
+            throw new InvalidOperationException($"Capture FrameArrived registration failed 0x{arrivalHr:X8}");
+        }
+        _arrivalToken = arrivalToken;
+        _arrivalSubscribed = true;
 
         IntPtr session;
         var createSession = (delegate* unmanaged[Stdcall]<IntPtr, IntPtr, IntPtr*, int>)
@@ -203,10 +256,26 @@ internal sealed unsafe class WgcCapture : IDisposable
             throw new InvalidOperationException($"StartCapture failed 0x{startHr:X8}");
         }
         Log.Info($"stream-capture: session started {_width}x{_height} hwnd=0x{_hwnd:X}");
+        _diagnostics?.CaptureStarted();
     }
 
     private void ReleaseSession()
     {
+        if (_arrival is { } arrival)
+        {
+            // Mark retired before removing the native subscription. A late
+            // invocation is a no-op; native refs retain the callback state.
+            arrival.Dispose();
+            if (_pool != IntPtr.Zero && _arrivalSubscribed)
+            {
+                var remove = (delegate* unmanaged[Stdcall]<IntPtr, long, int>)
+                    Wv2.Slot(_pool, WgcVtable.Pool_remove_FrameArrived);
+                remove(_pool, _arrivalToken);
+                _arrivalSubscribed = false;
+            }
+            _retiredCallbacks.Add(arrival.Completion);
+            _arrival = null;
+        }
         if (_session != IntPtr.Zero)
         {
             CloseAndRelease(_session);

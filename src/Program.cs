@@ -45,6 +45,11 @@ internal static class Program
     private static uint _hidePanelKioskMsg;
     private static uint _prefsChangedMsg;
     private static NexusApi? _api;
+    private static EfficiencyMemorySamplerController? _efficiencyMemory;
+    private static readonly string EfficiencyInstance = Guid.NewGuid().ToString("N");
+    private static string? _efficiencyAuthority, _efficiencyRun;
+    private static long _efficiencyRevision = -1;
+    private static int _efficiencyAckAttempts;
     private static WebView2MemorySampler? _memSampler;
     private static string _pairedToken = "";
     private static IntPtr _marshalerHwnd;
@@ -94,6 +99,8 @@ internal static class Program
         // blocking on the HTTP client here cannot deadlock.
         var state = BootAsync().GetAwaiter().GetResult();
         if (state is null) return 2;
+        using var efficiencyMemorySampler = _efficiencyMemory = new EfficiencyMemorySamplerController(Log.Info);
+        efficiencyMemorySampler.Update();
         _memSampler = new WebView2MemorySampler(_api);
 
         // Now safe to install: WebView2 callbacks fire on this thread once
@@ -601,6 +608,7 @@ internal static class Program
 
     private static void Apply(OverlayState state)
     {
+        ApplyEfficiency(state.Efficiency);
         _state = state;
         try { ApplyPanelKiosk(state); }
         catch (Exception ex) { Log.Error($"panel kiosk reconcile: {ex.Message}"); }
@@ -613,6 +621,44 @@ internal static class Program
         catch (Exception ex) { Log.Error($"stream-host reconcile: {ex.Message}"); }
         if (IsIdle()) MaybeArmIdleExitTimer();
         else DisarmIdleExitTimer();
+    }
+
+    private static void ApplyEfficiency(EfficiencyLeaseProjection? lease)
+    {
+        if (lease is null)
+        {
+            EfficiencyDiagnosticOptions.Deactivate();
+            _efficiencyMemory?.Update();
+            return;
+        }
+        var before = EfficiencyDiagnosticOptions.SessionRevision;
+        if (!EfficiencyDiagnosticOptions.Apply(lease.ServiceGeneration, lease.Revision, lease.RunId, lease.RemainingMs))
+        {
+            if (!DiagnosticLeaseGate.IsId(lease.ServiceGeneration) || lease.Revision < 0
+                || lease.RemainingMs is < 0 or > DiagnosticLeaseGate.MaximumMilliseconds
+                || (lease.RunId is not null && !DiagnosticLeaseGate.IsId(lease.RunId))
+                || (lease.RunId is null && lease.RemainingMs != 0))
+            {
+                EfficiencyDiagnosticOptions.Deactivate(); _efficiencyMemory?.Update();
+            }
+            return;
+        }
+        var current = EfficiencyDiagnosticOptions.SessionRevision;
+        if (before != current)
+            Log.Info($"[efficiency-session] localEpoch={current} authority={lease.ServiceGeneration} run={lease.RunId ?? "none"} revision={lease.Revision} active={(current == 0 ? 0 : 1)}");
+        _efficiencyMemory?.Update();
+        if (_efficiencyAuthority != lease.ServiceGeneration || _efficiencyRevision != lease.Revision || _efficiencyRun != lease.RunId)
+        {
+            _efficiencyAckAttempts = 0;
+            _efficiencyAuthority = lease.ServiceGeneration; _efficiencyRevision = lease.Revision; _efficiencyRun = lease.RunId;
+        }
+        if (current == 0 || lease.RunId is null || _efficiencyAckAttempts >= 3 || _api is null) return;
+        _efficiencyAckAttempts++;
+        _ = _api.PostEfficiencyAckAsync(new()
+        {
+            ServiceGeneration = lease.ServiceGeneration, Revision = lease.Revision,
+            RunId = lease.RunId, OverlayInstance = EfficiencyInstance,
+        });
     }
 
     private static void ApplyPanelKiosk(OverlayState state)

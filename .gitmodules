@@ -1,15 +1,15 @@
 [submodule "nexus-service"]
 	path = nexus-service
 	url = ../nexus-service.git
-	branch = main
+	branch = release/d215.37
 [submodule "nexus-web"]
 	path = nexus-web
 	url = ../nexus-web.git
-	branch = main
+	branch = release/d215.37
 [submodule "nexus-overlay"]
 	path = nexus-overlay
-	url = https://github.com/hello-nexus/nexus-overlay.git
-	branch = main
+	url = ../nexus.git
+	branch = release/d215.37-overlay
 [submodule "nexus-rgb"]
 	path = nexus-rgb
 	url = ../nexus-rgb.git
